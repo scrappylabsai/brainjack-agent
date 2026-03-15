@@ -75,7 +75,7 @@ cd brainjack-agent
 The installer:
 1. Creates a Python venv and installs dependencies
 2. Generates a secure auth token (saved to `.env`)
-3. Installs the appropriate system service (Task Scheduler / launchd / systemd)
+3. Sets up auto-start (Startup folder on Windows / launchd on macOS / systemd on Linux)
 4. Configures firewall rules (Windows) or installs input tools (Linux)
 
 After install, the agent is running on port `9898`. The auth token is printed to stdout -- copy it to your client app.
@@ -201,19 +201,37 @@ This is designed for private networks. The agent types keystrokes into your comp
 | Linux (X11) | `xdotool` | `sudo apt install xdotool` or `sudo pacman -S xdotool` |
 | Linux (Wayland) | `ydotool` | `sudo apt install ydotool` or `sudo pacman -S ydotool` |
 
-**Windows note:** No extra tools needed. The agent uses the native Win32 `SendInput` API. The installer adds a firewall rule for private networks.
-
 **macOS note:** System Preferences > Privacy & Security > Accessibility -- grant permission to Terminal (or whatever runs the agent).
+
+### Windows Notes
+
+No extra tools needed beyond Python 3.10+. The agent uses the native Win32 `SendInput` API via ctypes.
+
+**Why a Startup folder script instead of a Scheduled Task?**
+
+Windows has a quirk: the `SendInput` API can only inject keystrokes into the **interactive desktop** -- the one you see on your monitor. When a process is launched by a Scheduled Task (or via SSH, RDP, or any remote management tool), Windows puts it on a separate, invisible desktop. The process *thinks* it's injecting keystrokes (the API returns success), but nothing appears on screen.
+
+The Startup folder doesn't have this problem. Programs launched from `shell:startup` run in the same desktop session you're looking at, so `SendInput` works as expected.
+
+The installer creates:
+- **`brainjack.vbs`** in your Startup folder -- launches the agent hidden (no console window) every time you log in
+- **`Start-BrainJack.bat`** on your Desktop -- double-click to start manually if the agent isn't running
+
+**Microsoft Account / Windows Hello:**
+
+If you sign into Windows with a Microsoft account (email + PIN/fingerprint/face), auto-login at boot isn't possible without third-party tools. The agent will start automatically once you log in -- you just need to complete the Windows Hello sign-in first. This is a Windows limitation, not a BrainJack one.
+
+**Firewall:**
+
+The installer adds a firewall rule allowing inbound TCP on port 9898 across all network profiles (Private, Public, Domain). Windows often classifies WiFi networks as "Public" even on your home network, so restricting to Private-only would silently block connections.
 
 ## Service Management
 
 ```powershell
-# Windows (Scheduled Task)
-Get-ScheduledTask -TaskName "BrainJack Agent"
-Start-ScheduledTask -TaskName "BrainJack Agent"
-Stop-ScheduledTask -TaskName "BrainJack Agent"
-# Uninstall:
-.\install.ps1 -Uninstall
+# Windows
+# Start:     Double-click Start-BrainJack.bat on Desktop
+# Stop:      taskkill /F /IM pythonw.exe
+# Uninstall: .\install.ps1 -Uninstall
 ```
 
 ```bash
