@@ -115,6 +115,17 @@ def _char_to_vk(ch: str) -> int | None:
 # ctypes structures for SendInput
 # ---------------------------------------------------------------------------
 
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", ctypes.wintypes.LONG),
+        ("dy", ctypes.wintypes.LONG),
+        ("mouseData", ctypes.wintypes.DWORD),
+        ("dwFlags", ctypes.wintypes.DWORD),
+        ("time", ctypes.wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+    ]
+
+
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
         ("wVk", ctypes.wintypes.WORD),
@@ -125,9 +136,17 @@ class KEYBDINPUT(ctypes.Structure):
     ]
 
 
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", ctypes.wintypes.DWORD),
+        ("wParamL", ctypes.wintypes.WORD),
+        ("wParamH", ctypes.wintypes.WORD),
+    ]
+
+
 class INPUT(ctypes.Structure):
     class _INPUT_UNION(ctypes.Union):
-        _fields_ = [("ki", KEYBDINPUT)]
+        _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
     _fields_ = [
         ("type", ctypes.wintypes.DWORD),
         ("union", _INPUT_UNION),
@@ -170,21 +189,46 @@ def _make_unicode_input(char: str, keyup: bool = False) -> INPUT:
 # ---------------------------------------------------------------------------
 
 def inject_text(text: str) -> dict:
-    """Type text using Unicode SendInput events."""
+    """Type text using VK codes for ASCII, Unicode fallback for others."""
     try:
         for char in text:
             if char == "\n":
-                # Send Enter key press + release
                 _send_input(
                     _make_key_input(VK_RETURN),
                     _make_key_input(VK_RETURN, KEYEVENTF_KEYUP),
                 )
-            else:
+            elif char == " ":
                 _send_input(
-                    _make_unicode_input(char),
-                    _make_unicode_input(char, keyup=True),
+                    _make_key_input(VK_MAP["SPACE"]),
+                    _make_key_input(VK_MAP["SPACE"], KEYEVENTF_KEYUP),
                 )
-            time.sleep(0.012)  # 12ms delay, matching other backends
+            elif char == "\t":
+                _send_input(
+                    _make_key_input(VK_MAP["TAB"]),
+                    _make_key_input(VK_MAP["TAB"], KEYEVENTF_KEYUP),
+                )
+            else:
+                # Try VK code first (works in terminals like Warp)
+                vk = _char_to_vk(char)
+                if vk is not None:
+                    # Handle shifted characters (A-Z, !@#$%^&* etc.)
+                    result = ctypes.windll.user32.VkKeyScanW(ord(char))
+                    needs_shift = (result >> 8) & 0x01 if result != -1 else False
+                    if needs_shift:
+                        _send_input(_make_key_input(VK_SHIFT))
+                    _send_input(
+                        _make_key_input(vk),
+                        _make_key_input(vk, KEYEVENTF_KEYUP),
+                    )
+                    if needs_shift:
+                        _send_input(_make_key_input(VK_SHIFT, KEYEVENTF_KEYUP))
+                else:
+                    # Fallback to Unicode for non-ASCII
+                    _send_input(
+                        _make_unicode_input(char),
+                        _make_unicode_input(char, keyup=True),
+                    )
+            time.sleep(0.012)
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}

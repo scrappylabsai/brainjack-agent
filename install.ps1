@@ -28,6 +28,12 @@ if ($Uninstall) {
     } else {
         Write-Warn "No scheduled task found."
     }
+    # Remove startup VBS
+    $startupVbs = Join-Path ([Environment]::GetFolderPath("Startup")) "brainjack.vbs"
+    if (Test-Path $startupVbs) {
+        Remove-Item $startupVbs -Force
+        Write-Ok "Startup script removed."
+    }
     # Stop any running agent
     Get-Process -Name "python*" -ErrorAction SilentlyContinue | Where-Object {
         $_.CommandLine -like "*agent.py*"
@@ -155,57 +161,70 @@ if (-not $fwRule) {
     try {
         New-NetFirewallRule -DisplayName "BrainJack Agent" `
             -Direction Inbound -Protocol TCP -LocalPort 9898 `
-            -Action Allow -Profile Private `
-            -Description "Allow BrainJack Agent WebSocket connections on private networks" | Out-Null
-        Write-Ok "Firewall rule added (private networks only)."
+            -Action Allow -Profile Domain,Private,Public `
+            -Description "Allow BrainJack Agent WebSocket connections" | Out-Null
+        Write-Ok "Firewall rule added (all network profiles)."
     } catch {
         Write-Warn "Could not add firewall rule. Run as Administrator, or manually allow port 9898."
     }
 } else {
-    Write-Ok "Firewall rule already exists."
+    # Ensure rule covers all profiles (not just Private)
+    try {
+        Set-NetFirewallRule -DisplayName "BrainJack Agent" -Profile Domain,Private,Public
+        Write-Ok "Firewall rule updated (all network profiles)."
+    } catch {
+        Write-Ok "Firewall rule already exists."
+    }
 }
 
-# --- Scheduled Task (auto-start on login) ---
+# --- Auto-start via Startup folder ---
+# Uses a VBS launcher in the Startup folder instead of Scheduled Task.
+# Scheduled Tasks launched remotely (SSH/RDP) run on a detached desktop
+# and cannot inject keystrokes. The Startup folder runs in the interactive
+# desktop session, which is required for SendInput to work.
 Write-Step "Setting up auto-start..."
+
+# Remove any old Scheduled Task (doesn't work for SendInput)
 $existing = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existing) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Write-Ok "Removed old scheduled task (replaced by startup script)."
 }
 
-$action = New-ScheduledTaskAction `
-    -Execute $pythonVenv `
-    -Argument "agent.py" `
-    -WorkingDirectory $AgentDir
+# Create VBS launcher in Startup folder (runs hidden, no console window)
+$startupDir = [Environment]::GetFolderPath("Startup")
+$vbsPath = Join-Path $startupDir "brainjack.vbs"
+$vbsContent = @"
+Set WshShell = CreateObject("WScript.Shell")
+WshShell.Run "cmd /c cd /d $AgentDir && .venv\Scripts\pythonw.exe agent.py", 0, False
+"@
+Set-Content -Path $vbsPath -Value $vbsContent -Encoding ASCII
+Write-Ok "Startup script created (runs hidden on login)."
 
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-
-$settings = New-ScheduledTaskSettingsSet `
-    -AllowStartIfOnBatteries `
-    -DontStopIfGoingOnBatteries `
-    -RestartCount 3 `
-    -RestartInterval (New-TimeSpan -Seconds 30) `
-    -ExecutionTimeLimit (New-TimeSpan -Hours 0)
-
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $action `
-    -Trigger $trigger `
-    -Settings $settings `
-    -Description "BrainJack Agent — WebSocket HID injection service" | Out-Null
-
-Write-Ok "Scheduled task created (starts on login)."
+# Also create a desktop shortcut for manual start
+$desktopBat = Join-Path ([Environment]::GetFolderPath("Desktop")) "Start-BrainJack.bat"
+$batContent = @"
+@echo off
+cd /d $AgentDir
+echo Starting BrainJack Agent...
+start /B .venv\Scripts\pythonw.exe agent.py
+echo BrainJack Agent started on port 9898.
+timeout /t 3 /nobreak >nul
+"@
+Set-Content -Path $desktopBat -Value $batContent -Encoding ASCII
+Write-Ok "Desktop shortcut created (Start-BrainJack.bat)."
 
 # --- Start the agent now ---
 Write-Step "Starting BrainJack Agent..."
-Start-ScheduledTask -TaskName $TaskName
+$agentProc = Start-Process -FilePath $pythonVenv -ArgumentList "agent.py" `
+    -WorkingDirectory $AgentDir -PassThru -WindowStyle Hidden
 Start-Sleep -Seconds 2
 
-# Check if it's running
-$running = Get-ScheduledTask -TaskName $TaskName
-if ($running.State -eq "Running") {
+$listening = Get-NetTCPConnection -LocalPort 9898 -State Listen -ErrorAction SilentlyContinue
+if ($listening) {
     Write-Ok "Agent is running on port 9898!"
 } else {
-    Write-Warn "Agent may not have started. Check: Get-ScheduledTask -TaskName 'BrainJack Agent'"
+    Write-Warn "Agent may not have started. Double-click Start-BrainJack.bat on your Desktop."
 }
 
 # --- Summary ---
@@ -225,8 +244,7 @@ Write-Host "  3. Paste the auth token shown above" -ForegroundColor White
 Write-Host "  4. Start talking — words appear on screen" -ForegroundColor White
 Write-Host ""
 Write-Host "  Commands:" -ForegroundColor Yellow
-Write-Host "  Check status:  Get-ScheduledTask -TaskName 'BrainJack Agent'" -ForegroundColor Gray
-Write-Host "  Stop:          Stop-ScheduledTask -TaskName 'BrainJack Agent'" -ForegroundColor Gray
-Write-Host "  Start:         Start-ScheduledTask -TaskName 'BrainJack Agent'" -ForegroundColor Gray
+Write-Host "  Stop:          taskkill /F /IM pythonw.exe" -ForegroundColor Gray
+Write-Host "  Start:         Double-click Start-BrainJack.bat on Desktop" -ForegroundColor Gray
 Write-Host "  Uninstall:     .\install.ps1 -Uninstall" -ForegroundColor Gray
 Write-Host ""
