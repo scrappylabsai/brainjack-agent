@@ -867,7 +867,7 @@ async def _http_push_handler(reader: asyncio.StreamReader, writer: asyncio.Strea
 
         if method == "POST" and path == "/speak":
             content_length = int(headers.get("content-length", "0"))
-            body = await reader.read(content_length) if content_length else b""
+            body = await reader.readexactly(content_length) if content_length else b""
             try:
                 data = json.loads(body) if body else {}
             except json.JSONDecodeError:
@@ -886,7 +886,7 @@ async def _http_push_handler(reader: asyncio.StreamReader, writer: asyncio.Strea
         elif method == "POST" and path == "/push-audio":
             # Pre-generated audio — just relay to clients, no TTS call
             content_length = int(headers.get("content-length", "0"))
-            body = await reader.read(content_length) if content_length else b""
+            body = await reader.readexactly(content_length) if content_length else b""
             try:
                 data = json.loads(body) if body else {}
             except json.JSONDecodeError:
