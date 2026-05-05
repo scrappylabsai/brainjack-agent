@@ -563,6 +563,109 @@ def inject_text(text: str) -> dict:
 # Clipboard injection (write text to system clipboard, no keystrokes)
 # ---------------------------------------------------------------------------
 
+def _clear_clipboard() -> dict:
+    """Wipe the system clipboard. Used as bookends around paste-mode injection
+    so the user never gets our payload as their next paste, AND a half-failed
+    set never leaves yesterday's content as the 'next thing to paste'.
+
+    Each platform needs its own clear primitive — `wl-copy --clear` on Wayland,
+    `xsel -bc` on X11 (or empty `xclip`), and pbcopy from /dev/null on macOS."""
+    if PLATFORM == "macos":
+        try:
+            subprocess.run(["pbcopy"], input=b"", capture_output=True, timeout=3)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    if PLATFORM in ("linux-x11", "linux-wayland"):
+        # Try the matching tool for the session, fall back across both selections
+        # for robustness on mixed XWayland setups.
+        attempts: list[list[str]] = []
+        if PLATFORM == "linux-wayland" and shutil.which("wl-copy"):
+            attempts.append(["wl-copy", "--clear"])
+        if shutil.which("xsel"):
+            attempts.append(["xsel", "-bc"])
+        if shutil.which("xclip"):
+            # `xclip` doesn't have a clear flag — set to empty stdin instead.
+            attempts.append(["xclip", "-selection", "clipboard", "/dev/null"])
+        for cmd in attempts:
+            try:
+                subprocess.run(cmd, capture_output=True, timeout=3)
+            except Exception:
+                continue
+        return {"ok": True}  # best-effort; missing tools logged at startup
+
+    return {"ok": True}  # windows handled separately; default no-op
+
+
+def _ctrl_v() -> dict:
+    """Issue a Ctrl+V (or Cmd+V on macOS) keystroke to paste current clipboard.
+    Reuses the same per-platform key synthesis the `combo` cmd uses."""
+    if PLATFORM == "macos":
+        if _HAS_QUARTZ:
+            _cg_post_key(9, 0x100000)  # Cmd+V
+            return {"ok": True}
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke "v" using command down'],
+                capture_output=True, text=True, timeout=4,
+            )
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    if PLATFORM == "linux-x11":
+        try:
+            r = subprocess.run(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                capture_output=True, text=True, timeout=4,
+            )
+            return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    if PLATFORM == "linux-wayland":
+        # ydotool keycodes: KEY_LEFTCTRL=29, KEY_V=47. Press both, release both.
+        try:
+            r = subprocess.run(
+                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                capture_output=True, text=True, timeout=4,
+            )
+            return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    return {"ok": False, "error": f"unsupported platform: {PLATFORM}"}
+
+
+def inject_paste(text: str) -> dict:
+    """Paste-mode injection — fast on Linux for long payloads (clipboard hop
+    instead of per-keystroke synthesis). Follows the safety contract:
+
+      1. Clear clipboard first  (so a half-failed `set` can't paste yesterday)
+      2. Set clipboard to text
+      3. Issue Ctrl+V / Cmd+V
+      4. Sleep briefly to let the paste settle
+      5. Clear clipboard again  (so our payload doesn't linger)
+
+    Caller's clipboard is not preserved — the user opted into this with
+    `--paste`. The trade is speed for clipboard side-effect.
+    """
+    _clear_clipboard()
+    set_result = inject_clipboard(text)
+    if not set_result.get("ok"):
+        return {"ok": False, "error": f"clipboard set failed: {set_result.get('error')}"}
+    paste_result = _ctrl_v()
+    # Settle the paste before wiping; longer texts need more time to be
+    # consumed by the receiver before the clipboard clear races them.
+    time.sleep(min(0.5, 0.05 + len(text) / 50000))
+    _clear_clipboard()
+    if not paste_result.get("ok"):
+        return {"ok": False, "error": f"paste keystroke failed: {paste_result.get('error')}"}
+    return {"ok": True, "mode": "paste", "chars": len(text)}
+
+
 def inject_clipboard(text: str) -> dict:
     """Write text to the system clipboard without typing anything."""
     if PLATFORM == "macos":
@@ -840,6 +943,14 @@ def handle_command(data: dict) -> dict:
         if not text:
             return {"ok": False, "error": "missing text"}
         return inject_text(text)
+
+    if cmd == "paste":
+        # Fast-path injection for network use: clipboard-hop + Ctrl+V instead of
+        # per-keystroke synthesis. Bracketed by clipboard clears for safety.
+        text = data.get("text", "")
+        if not text:
+            return {"ok": False, "error": "missing text"}
+        return inject_paste(text)
 
     if cmd == "clipboard":
         text = data.get("text", "")
