@@ -415,23 +415,51 @@ XDOTOOL_MODIFIERS = {
 # Text injection
 # ---------------------------------------------------------------------------
 
+def _type_timeout_for(text: str) -> float:
+    # ~12ms per char (--key-delay/--delay), plus 5s slack for spawn + sync.
+    # Cap at 90s so a runaway typing op doesn't pin the agent forever.
+    return max(15.0, min(90.0, len(text) * 0.025 + 5.0))
+
+
+def _ydotool_release_all() -> None:
+    """Send key-release events across the common keyboard range to recover
+    from a stuck-key state after ydotool was killed mid-keystroke."""
+    try:
+        releases = [f"{code}:0" for code in range(1, 128)]
+        subprocess.run(
+            ["ydotool", "key"] + releases,
+            capture_output=True, text=True, timeout=4,
+        )
+    except Exception:
+        pass
+
+
 def inject_text(text: str) -> dict:
     if PLATFORM == "windows":
         return _win_inject_text(text)
 
+    timeout = _type_timeout_for(text)
+
     if PLATFORM == "linux-x11":
-        r = subprocess.run(
-            ["xdotool", "type", "--delay", "12", "--clearmodifiers", "--", text],
-            capture_output=True, text=True, timeout=10,
-        )
-        return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        try:
+            r = subprocess.run(
+                ["xdotool", "type", "--delay", "12", "--clearmodifiers", "--", text],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "error": f"xdotool timeout after {timeout:.1f}s"}
 
     if PLATFORM == "linux-wayland":
-        r = subprocess.run(
-            ["ydotool", "type", "--key-delay", "12", "--", text],
-            capture_output=True, text=True, timeout=10,
-        )
-        return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        try:
+            r = subprocess.run(
+                ["ydotool", "type", "--key-delay", "12", "--", text],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
+        except subprocess.TimeoutExpired:
+            _ydotool_release_all()
+            return {"ok": False, "error": f"ydotool timeout after {timeout:.1f}s; released all keys"}
 
     if PLATFORM == "macos":
         # Preserve full transcription in clipboard as backup before line-by-line inject
