@@ -30,6 +30,7 @@ import logging.handlers
 import os
 import platform
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -48,8 +49,9 @@ import websockets
 # Config
 # ---------------------------------------------------------------------------
 
-def _load_dotenv(path: Path) -> None:
-    """Minimal .env loader — no dependencies."""
+def _load_dotenv(path: Path, override: bool = False) -> None:
+    """Minimal .env loader — no dependencies. With override=True, replaces
+    any already-set os.environ values (used by SIGHUP reload)."""
     if not path.is_file():
         return
     with open(path) as f:
@@ -60,8 +62,36 @@ def _load_dotenv(path: Path) -> None:
             key, _, val = line.partition("=")
             key = key.strip()
             val = val.strip().strip("'\"")
-            if key and key not in os.environ:
+            if not key:
+                continue
+            if override or key not in os.environ:
                 os.environ[key] = val
+
+
+def _parse_tokens(token_raw: str, tokens_raw: str) -> dict[str, str] | None:
+    """Build the token -> alias map.
+
+    Sources, in priority order:
+      BRAINJACK_TOKENS=alice:xxx,bob:yyy  (multi-token, alias-tagged)
+      BRAINJACK_TOKEN=zzz                 (legacy single token, alias 'default')
+
+    Returns None if auth is disabled.
+    """
+    if tokens_raw and tokens_raw.lower() != "off":
+        out: dict[str, str] = {}
+        for entry in tokens_raw.split(","):
+            entry = entry.strip()
+            if not entry or ":" not in entry:
+                continue
+            alias, tok = entry.split(":", 1)
+            tok = tok.strip()
+            if tok:
+                out[tok] = alias.strip() or "unnamed"
+        if out:
+            return out
+    if token_raw and token_raw.lower() != "off":
+        return {token_raw: "default"}
+    return None
 
 
 def load_config(cli_args: argparse.Namespace) -> dict:
@@ -70,10 +100,14 @@ def load_config(cli_args: argparse.Namespace) -> dict:
     _load_dotenv(agent_dir / ".env")
 
     token_raw = os.environ.get("BRAINJACK_TOKEN", "").strip()
-    auth_enabled = bool(token_raw) and token_raw.lower() != "off"
+    tokens_raw = os.environ.get("BRAINJACK_TOKENS", "").strip()
+    tokens_map = _parse_tokens(token_raw, tokens_raw)
 
     cfg = {
-        "token": token_raw if auth_enabled else None,
+        # NOTE: legacy "token" field kept for back-compat readers; primary auth
+        # goes through "tokens" (a {token: alias} map). None disables auth.
+        "token": next(iter(tokens_map)) if tokens_map and len(tokens_map) == 1 else None,
+        "tokens": tokens_map,
         "host": cli_args.host or os.environ.get("BRAINJACK_HOST", "0.0.0.0"),
         "port": cli_args.port or int(os.environ.get("BRAINJACK_PORT", "9898")),
         "tls_cert": cli_args.tls_cert or os.environ.get("BRAINJACK_TLS_CERT", ""),
@@ -96,6 +130,23 @@ def load_config(cli_args: argparse.Namespace) -> dict:
         cfg["tls_key"] = ""
 
     return cfg
+
+
+def reload_tokens_into(cfg: dict) -> tuple[int, list[str]]:
+    """Re-read .env and update cfg['tokens'] in-place. Used by SIGHUP.
+
+    Returns (new_count, alias_list) for log/audit.
+    """
+    agent_dir = Path(__file__).resolve().parent
+    _load_dotenv(agent_dir / ".env", override=True)
+    token_raw = os.environ.get("BRAINJACK_TOKEN", "").strip()
+    tokens_raw = os.environ.get("BRAINJACK_TOKENS", "").strip()
+    tokens_map = _parse_tokens(token_raw, tokens_raw)
+    cfg["tokens"] = tokens_map
+    cfg["token"] = next(iter(tokens_map)) if tokens_map and len(tokens_map) == 1 else None
+    n = len(tokens_map) if tokens_map else 0
+    aliases = sorted(tokens_map.values()) if tokens_map else []
+    return n, aliases
 
 # ---------------------------------------------------------------------------
 # Audit logger
@@ -214,14 +265,26 @@ def _get_client_ip(websocket, cfg: dict) -> str:
     return addr[0] if addr else "unknown"
 
 
-def _check_token(provided: str, expected: str) -> bool:
-    return hmac.compare_digest(provided.encode(), expected.encode())
+def _check_token(provided: str, tokens_map: dict[str, str] | None) -> str | None:
+    """Return the alias of the matched token, or None.
+
+    Constant-time compare against every known token so timing attacks can't
+    enumerate aliases.
+    """
+    if not tokens_map:
+        return None
+    matched_alias: str | None = None
+    pb = provided.encode()
+    for tok, alias in tokens_map.items():
+        if hmac.compare_digest(pb, tok.encode()):
+            matched_alias = alias  # don't break — keep timing constant
+    return matched_alias
 
 
 async def authenticate(websocket, cfg: dict) -> bool:
     """Handle auth. Returns True if client is authorized to send commands."""
-    token = cfg["token"]
-    if token is None:
+    tokens_map = cfg.get("tokens")
+    if tokens_map is None:
         return True  # Auth disabled
 
     peer = _get_client_ip(websocket, cfg)
@@ -229,9 +292,11 @@ async def authenticate(websocket, cfg: dict) -> bool:
     # Check query string first (zero-iOS-change migration path)
     qs = parse_qs(urlparse(websocket.request.path).query)
     qs_tokens = qs.get("token", [])
-    if qs_tokens and _check_token(qs_tokens[0], token):
-        audit("auth_ok", peer, method="query_string")
-        return True
+    if qs_tokens:
+        alias = _check_token(qs_tokens[0], tokens_map)
+        if alias:
+            audit("auth_ok", peer, method="query_string", alias=alias)
+            return True
 
     # First-message handshake with 5s timeout
     try:
@@ -248,8 +313,9 @@ async def authenticate(websocket, cfg: dict) -> bool:
         await websocket.close(1008, "invalid auth message")
         return False
 
-    if data.get("cmd") == "auth" and _check_token(data.get("token", ""), token):
-        audit("auth_ok", peer, method="handshake")
+    alias = _check_token(data.get("token", ""), tokens_map)
+    if data.get("cmd") == "auth" and alias:
+        audit("auth_ok", peer, method="handshake", alias=alias)
         await websocket.send(json.dumps({"ok": True, "authed": True}))
         return True
 
@@ -1029,13 +1095,44 @@ async def main(cfg: dict):
 
     proto = "wss" if ssl_ctx else "ws"
     host, port = cfg["host"], cfg["port"]
+    n_tokens = len(cfg["tokens"]) if cfg["tokens"] else 0
     print(f"[brainjack] Platform: {PLATFORM}")
     print(f"[brainjack] Listening on {proto}://{host}:{port}")
-    print(f"[brainjack] Auth: {'enabled' if cfg['token'] else 'disabled'}")
+    print(f"[brainjack] Auth: {'enabled (' + str(n_tokens) + ' token' + ('s' if n_tokens != 1 else '') + ')' if cfg['tokens'] else 'disabled'}")
     print(f"[brainjack] TLS: {'enabled' if ssl_ctx else 'disabled'}")
     print(f"[brainjack] Rate limit: {cfg['rate_limit']}/{cfg['rate_window']}s burst={cfg['rate_burst']}")
     if cfg["behind_proxy"]:
         print("[brainjack] Proxy mode: trusting X-Forwarded-For")
+
+    # Plaintext-on-the-wire warning. Tokens and keystrokes flow over `ws://` if
+    # TLS is disabled; only safe over an encrypted substrate (Tailscale,
+    # WireGuard, SSH tunnel) — bare LAN binding without TLS leaks tokens.
+    if not ssl_ctx and host not in ("127.0.0.1", "::1", "localhost"):
+        print(
+            "[brainjack] ⚠ WARNING: binding non-loopback without TLS. "
+            "Tokens and keystrokes are plaintext on the wire. Safe only "
+            "over an encrypted substrate (Tailscale/WireGuard/SSH). "
+            "For local-only safety set BRAINJACK_HOST=127.0.0.1.",
+            file=sys.stderr,
+        )
+
+    # SIGHUP reloads the .env so tokens can be rotated without restart.
+    # Only meaningful on POSIX — Windows skips silently.
+    def _on_sighup() -> None:
+        try:
+            n, aliases = reload_tokens_into(cfg)
+            audit("config_reload", "self", method="SIGHUP", n_tokens=n, aliases=",".join(aliases))
+            print(f"[brainjack] SIGHUP — reloaded {n} token(s): {aliases}", file=sys.stderr)
+        except Exception as e:
+            print(f"[brainjack] SIGHUP reload failed: {e}", file=sys.stderr)
+
+    if hasattr(signal, "SIGHUP"):
+        loop = asyncio.get_running_loop()
+        try:
+            loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+            print("[brainjack] SIGHUP handler installed (kill -HUP <pid> to reload tokens)")
+        except NotImplementedError:
+            pass  # e.g. running under a non-POSIX event loop
 
     async def ios_compat(connection, request):
         """iOS URLSessionWebSocketTask sends Connection: keep-alive instead of
