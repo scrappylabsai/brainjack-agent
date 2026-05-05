@@ -598,9 +598,20 @@ def _clear_clipboard() -> dict:
     return {"ok": True}  # windows handled separately; default no-op
 
 
-def _ctrl_v() -> dict:
-    """Issue a Ctrl+V (or Cmd+V on macOS) keystroke to paste current clipboard.
-    Reuses the same per-platform key synthesis the `combo` cmd uses."""
+def _paste_keystroke() -> dict:
+    """Issue a paste keystroke to the focused window using current clipboard.
+
+    Per-platform paste-shortcut convention (terminal-emulator-friendly):
+      - macOS: Cmd+V  (universal — both terminals and non-terminals)
+      - Linux X11/Wayland: Ctrl+Shift+V  (terminal-emulator standard;
+            kitty/wezterm/alacritty/foot/konsole/gnome-terminal/xterm all
+            paste on Ctrl+Shift+V. Plain Ctrl+V is 'insert literal' in
+            terminals — would silently eat the paste. Most non-terminal
+            GTK/Qt apps also accept Ctrl+Shift+V.)
+
+    Set the env BRAINJACK_PASTE_USE_PLAIN_CTRL_V=1 to use Ctrl+V instead
+    for fleets that are mostly non-terminal targets.
+    """
     if PLATFORM == "macos":
         if _HAS_QUARTZ:
             _cg_post_key(9, 0x100000)  # Cmd+V
@@ -615,10 +626,13 @@ def _ctrl_v() -> dict:
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    use_plain = os.environ.get("BRAINJACK_PASTE_USE_PLAIN_CTRL_V", "").lower() in ("1", "true", "yes")
+
     if PLATFORM == "linux-x11":
+        combo = "ctrl+v" if use_plain else "ctrl+shift+v"
         try:
             r = subprocess.run(
-                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                ["xdotool", "key", "--clearmodifiers", combo],
                 capture_output=True, text=True, timeout=4,
             )
             return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
@@ -626,10 +640,14 @@ def _ctrl_v() -> dict:
             return {"ok": False, "error": str(e)}
 
     if PLATFORM == "linux-wayland":
-        # ydotool keycodes: KEY_LEFTCTRL=29, KEY_V=47. Press both, release both.
+        # ydotool keycodes: KEY_LEFTCTRL=29, KEY_LEFTSHIFT=42, KEY_V=47
+        if use_plain:
+            keys = ["29:1", "47:1", "47:0", "29:0"]
+        else:
+            keys = ["29:1", "42:1", "47:1", "47:0", "42:0", "29:0"]
         try:
             r = subprocess.run(
-                ["ydotool", "key", "29:1", "47:1", "47:0", "29:0"],
+                ["ydotool", "key"] + keys,
                 capture_output=True, text=True, timeout=4,
             )
             return {"ok": r.returncode == 0, "error": r.stderr.strip() or None}
@@ -639,27 +657,68 @@ def _ctrl_v() -> dict:
     return {"ok": False, "error": f"unsupported platform: {PLATFORM}"}
 
 
-def inject_paste(text: str) -> dict:
-    """Paste-mode injection — fast on Linux for long payloads (clipboard hop
-    instead of per-keystroke synthesis). Follows the safety contract:
+def _ydotool_fast_type(text: str) -> dict:
+    """Linux 'paste-mode' for Wayland: same ydotool kernel-uinput path that
+    streaming uses, but with --key-delay 1 instead of 12. Feels instant for
+    typical payloads, but is compositor-agnostic (works under KWin, GNOME
+    Mutter, Hyprland, sway, anything) because it sits below the compositor.
 
-      1. Clear clipboard first  (so a half-failed `set` can't paste yesterday)
-      2. Set clipboard to text
-      3. Issue Ctrl+V / Cmd+V
-      4. Sleep briefly to let the paste settle
-      5. Clear clipboard again  (so our payload doesn't linger)
+    Why not wtype: only wlroots-based compositors (Hyprland/sway/etc.)
+    expose wlr-virtual-keyboard. KWin and Mutter don't, so wtype fails on
+    KDE/GNOME Wayland sessions.
 
-    Caller's clipboard is not preserved — the user opted into this with
-    `--paste`. The trade is speed for clipboard side-effect.
+    Why not clipboard-hop: Wayland scopes clipboard selections per-client.
+    `wl-copy` from one client + `Ctrl+Shift+V` from a different focused
+    client is unreliable; the focused app's selection may not be ours.
+
+    Why ydotool with --key-delay 1: same code path as the trusted streaming
+    type, just unthrottled. Roughly 12x faster (700 chars in ~0.7s vs ~8.4s
+    at the default delay) without changing dependencies or compositor
+    assumptions.
     """
+    timeout = max(15.0, min(90.0, len(text) * 0.005 + 5.0))  # ~5ms/char + 5s slack
+    try:
+        r = subprocess.run(
+            ["ydotool", "type", "--key-delay", "1", "--", text],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if r.returncode != 0:
+            return {"ok": False, "error": (r.stderr or "ydotool failed").strip()}
+        return {"ok": True, "mode": "ydotool-fast", "chars": len(text)}
+    except subprocess.TimeoutExpired:
+        _ydotool_release_all()
+        return {"ok": False, "error": f"ydotool timeout after {timeout:.1f}s; released all keys"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def inject_paste(text: str) -> dict:
+    """Fast injection mode (network use case).
+
+    Per-platform implementation, picked for the constraint that actually
+    matters on each:
+
+      - macOS:        pbcopy + Cmd+V         (universal paste shortcut, no isolation)
+      - linux-x11:    clipboard + Ctrl+Shift+V with clear-set-paste-clear safety contract
+      - linux-wayland: ydotool with --key-delay 1   (compositor-agnostic, no clipboard,
+                       no virtual-keyboard protocol dependency)
+      - windows:      type fallback (paste-mode unimplemented for now)
+    """
+    if PLATFORM == "linux-wayland":
+        return _ydotool_fast_type(text)
+
+    if PLATFORM == "windows":
+        return inject_text(text)
+
+    # macOS + linux-x11: clipboard-hop with safety contract
     _clear_clipboard()
     set_result = inject_clipboard(text)
     if not set_result.get("ok"):
         return {"ok": False, "error": f"clipboard set failed: {set_result.get('error')}"}
-    paste_result = _ctrl_v()
-    # Settle the paste before wiping; longer texts need more time to be
-    # consumed by the receiver before the clipboard clear races them.
-    time.sleep(min(0.5, 0.05 + len(text) / 50000))
+    paste_result = _paste_keystroke()
+    # Settle the paste before wiping. The receiver-side app needs time to
+    # consume the paste event before we clear the source clipboard.
+    time.sleep(min(1.5, 0.30 + len(text) * 0.001))
     _clear_clipboard()
     if not paste_result.get("ok"):
         return {"ok": False, "error": f"paste keystroke failed: {paste_result.get('error')}"}
