@@ -657,6 +657,59 @@ def _paste_keystroke() -> dict:
     return {"ok": False, "error": f"unsupported platform: {PLATFORM}"}
 
 
+def _qdbus_bin() -> str | None:
+    """Pick the right qdbus binary — qdbus6 on Plasma 6, qdbus on Plasma 5."""
+    return shutil.which("qdbus6") or shutil.which("qdbus")
+
+
+def _klipper_set(text: str) -> bool:
+    """Set clipboard via KDE Plasma's Klipper dbus. Returns True if the
+    call succeeded (Klipper present + responsive). Klipper is part of the
+    trusted user session, so its clipboard offer is visible to every focused
+    app — works around the wl-copy cross-client isolation that bit us in
+    earlier paste-mode attempts."""
+    qdbus = _qdbus_bin()
+    if not qdbus:
+        return False
+    try:
+        r = subprocess.run(
+            [qdbus, "org.kde.klipper", "/klipper",
+             "org.kde.klipper.klipper.setClipboardContents", text],
+            capture_output=True, text=True, timeout=3,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def _klipper_clear() -> None:
+    qdbus = _qdbus_bin()
+    if not qdbus:
+        return
+    try:
+        subprocess.run(
+            [qdbus, "org.kde.klipper", "/klipper",
+             "org.kde.klipper.klipper.clearClipboardContents"],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception:
+        pass
+
+
+def _inject_paste_klipper(text: str) -> dict:
+    """KDE Plasma 'true paste' path: Klipper dbus set → Ctrl+Shift+V →
+    brief settle → Klipper clear. Returns ok:False if Klipper isn't
+    available so the caller can fall back to fast-type."""
+    if not _klipper_set(text):
+        return {"ok": False, "error": "klipper unavailable"}
+    paste_result = _paste_keystroke()
+    time.sleep(min(1.5, 0.30 + len(text) * 0.001))
+    _klipper_clear()
+    if not paste_result.get("ok"):
+        return {"ok": False, "error": f"paste keystroke failed: {paste_result.get('error')}"}
+    return {"ok": True, "mode": "klipper", "chars": len(text)}
+
+
 def _ydotool_fast_type(text: str) -> dict:
     """Linux 'paste-mode' for Wayland: same ydotool kernel-uinput path that
     streaming uses, but with --key-delay 1 instead of 12. Feels instant for
@@ -705,6 +758,13 @@ def inject_paste(text: str) -> dict:
       - windows:      type fallback (paste-mode unimplemented for now)
     """
     if PLATFORM == "linux-wayland":
+        # KDE Plasma: try Klipper dbus first — true clipboard buffer paste,
+        # near-instant regardless of payload size. Falls back to ydotool
+        # fast-type if Klipper isn't present (other compositors, headless,
+        # or Plasma not running).
+        klip = _inject_paste_klipper(text)
+        if klip.get("ok"):
+            return klip
         return _ydotool_fast_type(text)
 
     if PLATFORM == "windows":
